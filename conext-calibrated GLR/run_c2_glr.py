@@ -3,6 +3,8 @@
 run_c2_glr.py
 -------------
 Runner script for C²-GLR on a household water dataset.
+
+Adds defensive cleaning to eliminate NaNs before training.
 """
 
 import argparse
@@ -18,20 +20,36 @@ from c2_glr import (
 
 def load_and_prepare(csv_path: Path) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
-    # Expected columns:
-    # 'timestamp_utc','activity_label','consumption_m3_per_min','dishwasher_running',
-    # 'has_activity','occupied','total_m3','washing_machine_running'
+
+    # Ensure timestamp exists and is parseable
+    if "timestamp_utc" not in df.columns:
+        raise ValueError("CSV must include 'timestamp_utc'")
+    df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce")
+    df = df.dropna(subset=["timestamp_utc"]).sort_values("timestamp_utc").reset_index(drop=True)
+
+    # Consumption to L/min
     if "consumption_L_per_min" not in df.columns:
         if "consumption_m3_per_min" in df.columns:
             df["consumption_L_per_min"] = df["consumption_m3_per_min"].astype(float) * 1000.0
         else:
             raise ValueError("Expected consumption_m3_per_min or consumption_L_per_min in CSV")
 
+    # Clip negatives and interpolate small gaps in consumption
+    df["consumption_L_per_min"] = df["consumption_L_per_min"].astype(float)
+    df["consumption_L_per_min"] = df["consumption_L_per_min"].clip(lower=0)
+
+    # Binary columns: fill NaN -> 0 and cast to int
     for b in ["occupied", "has_activity", "dishwasher_running", "washing_machine_running"]:
         if b not in df.columns:
             df[b] = 0
+        df[b] = df[b].fillna(0).astype(int)
 
-    df = df.sort_values("timestamp_utc").reset_index(drop=True)
+    # Optional: interpolate short missing runs in consumption (time-aware)
+    if df["consumption_L_per_min"].isna().any():
+        df = df.set_index("timestamp_utc")
+        df["consumption_L_per_min"] = df["consumption_L_per_min"].interpolate(method="time", limit=60).fillna(0.0)
+        df = df.reset_index()
+
     return df
 
 
@@ -127,7 +145,6 @@ def main():
     if args.inject:
         labels_path = Path(f"{out_prefix}_labels.csv")
         labels = pd.read_csv(labels_path)["label"].values
-        # Align and score
         L = min(len(labels), len(det))
         labels = labels[:L]
         pred = np.zeros(L, dtype=int)
