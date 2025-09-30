@@ -1,4 +1,3 @@
-
 """
 run_c2_glr.py
 -------------
@@ -69,6 +68,14 @@ def main():
     ap.add_argument("--add-delta", type=float, default=0.5, help="L/min additive pulse size if --inject")
     ap.add_argument("--ded-delta", type=float, default=0.5, help="L/min deductive pulse size if --inject")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--inject-anywhere", action="store_true", help="Inject attacks regardless of context gate (for testing)")
+    ap.add_argument("--eta-pos", type=float, default=60.0, help="GLR threshold for positive (additive) shifts")
+    ap.add_argument("--eta-neg", type=float, default=60.0, help="GLR threshold for negative (deductive) shifts")
+    ap.add_argument("--debounce-K", type=int, default=3, help="Require at least K hits in last M to raise alarm")
+    ap.add_argument("--debounce-M", type=int, default=10, help="Window M for debounce counting")
+    ap.add_argument("--fusion", type=str, choices=["and","or"], default="and", help="Fuse conformal and GLR via AND (default) or OR")
+    ap.add_argument("--no-glr", action="store_true", help="Disable GLR for debugging (conformal only)")
+    ap.add_argument("--no-conformal", action="store_true", help="Disable conformal for debugging (GLR only)")
     args = ap.parse_args()
 
     csv_path = Path(args.csv)
@@ -77,6 +84,7 @@ def main():
     fig_dir = out_dir / "figures"
 
     df = load_and_prepare(csv_path)
+    df = add_time_features(df, "timestamp_utc")
 
     if args.inject:
         from c2_glr import AttackSpec
@@ -84,7 +92,7 @@ def main():
             AttackSpec(mode="additive", delta_L_per_min=args.add_delta, prob_per_min=0.004),
             AttackSpec(mode="deductive", delta_L_per_min=args.ded_delta, prob_per_min=0.004),
         ]
-        df_attacked, labels = inject_attacks(df, specs, seed=args.seed)
+        df_attacked, labels = inject_attacks(df, specs, seed=args.seed, respect_gate=(not args.inject_anywhere))
         df_to_use = df_attacked
         labels_path = Path(f"{out_prefix}_labels.csv")
         attacked_path = Path(f"{out_prefix}_attacked.csv")
@@ -92,10 +100,27 @@ def main():
         labels.to_csv(labels_path, index=False, header=["label"])
         print(f"[OK] Saved injected series -> {attacked_path}")
         print(f"[OK] Saved labels         -> {labels_path}")
+        # Quick diagnostic: count labels
+        try:
+            import numpy as np
+            uniq, cnts = np.unique(labels.values, return_counts=True)
+            print("[Diag] label counts:", dict(zip(uniq.tolist(), cnts.tolist())))
+        except Exception as e:
+            pass
     else:
         df_to_use = df
 
-    params = DetectorParams(train_days=args.train_days, alpha=args.alpha)
+    params = DetectorParams(
+        train_days=args.train_days,
+        alpha=args.alpha,
+        eta_pos=args.eta_pos,
+        eta_neg=args.eta_neg,
+        debounce_K=args.debounce_K,
+        debounce_M=args.debounce_M,
+        fusion=args.fusion,
+        use_glr=(not args.no_glr),
+        use_conformal=(not args.no_conformal),
+    )
     det = run_c2_glr(df_to_use, params)
     det_path = Path(f"{out_prefix}_detections.csv")
     det.to_csv(det_path, index=False)

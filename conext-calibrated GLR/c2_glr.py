@@ -1,4 +1,3 @@
-
 """
 c2_glr.py
 ---------
@@ -54,15 +53,16 @@ def add_lags(df: pd.DataFrame, y_col: str, lags=(1, 2, 3, 5, 10)) -> pd.DataFram
 
 def default_gate(row: pd.Series) -> int:
     """
-    Default high-usage context gate: occupied AND (evening hour OR any appliance running)
+    High-usage context gate: (occupied OR has_activity) AND (evening OR appliance_on OR has_activity)
+    - Robust to missing columns; defaults to 0.
     """
     occupied = int(row.get("occupied", 0) or 0)
-    hour = int(row.get("hour", 0) or 0)
-    app_d = int(row.get("dishwasher_running", 0) or 0)
-    app_w = int(row.get("washing_machine_running", 0) or 0)
-    appliance_on = int(app_d or app_w)
-    is_evening = int(18 <= hour < 23)
-    return int(occupied == 1 and (is_evening or appliance_on))
+    has_act  = int(row.get("has_activity", 0) or 0)
+    hour     = int(row.get("hour", 0) or 0)
+    app_on   = int(row.get("dishwasher_running", 0) or 0) or int(row.get("washing_machine_running", 0) or 0)
+    is_even  = 18 <= hour < 23
+    # Gate opens if there is explicit activity, or if occupied and (evening or an appliance is on)
+    return int((has_act == 1) or (occupied == 1 and (is_even or app_on)))
 
 
 def stratum_id(row: pd.Series) -> Tuple[int, int, int]:
@@ -268,6 +268,12 @@ class DetectorParams:
     roll_windows: Tuple[int,...] = (5, 15, 60)
     lags: Tuple[int,...] = (1, 2, 3, 5, 10)
 
+    # NEW: how to fuse conformal and GLR decisions: "and" or "or"
+    fusion: str = "and"
+    # NEW: enable/disable components for debugging
+    use_conformal: bool = True
+    use_glr: bool = True
+
 
 def make_features(df: pd.DataFrame, y_col: str = "consumption_L_per_min") -> Tuple[pd.DataFrame, List[str]]:
     df = add_time_features(df, "timestamp_utc")
@@ -344,8 +350,18 @@ def run_c2_glr(df: pd.DataFrame, params: DetectorParams) -> pd.DataFrame:
         gate = default_gate(row)
         a_pos, a_neg = glr.update(r_t, sigma_t, gate)
 
-        add_hit = (pval < params.alpha) and a_pos
-        ded_hit = (pval < params.alpha) and a_neg
+        # Combine evidence with configurable fusion
+        glr_add = bool(a_pos) if params.use_glr else False
+        glr_ded = bool(a_neg) if params.use_glr else False
+        conf_add = (pval < params.alpha) if params.use_conformal else False
+        conf_ded = (pval < params.alpha) if params.use_conformal else False
+
+        if params.fusion.lower() == "or":
+            add_hit = glr_add or conf_add
+            ded_hit = glr_ded or conf_ded
+        else:  # default "and"
+            add_hit = glr_add and conf_add
+            ded_hit = glr_ded and conf_ded
 
         deb_add_q.append(1 if add_hit else 0)
         deb_ded_q.append(1 if ded_hit else 0)
@@ -365,6 +381,9 @@ def run_c2_glr(df: pd.DataFrame, params: DetectorParams) -> pd.DataFrame:
             "alarm_additive": alarm_add,
             "alarm_deductive": alarm_ded,
             "cpd_reset": int(cpd_trig),
+            "glr_add_raw": int(glr_add),
+            "glr_ded_raw": int(glr_ded),
+            "p_below_alpha": int(pval < params.alpha),
         })
 
     return pd.DataFrame(out)
@@ -383,11 +402,11 @@ class AttackSpec:
     prob_per_min: float = 0.005
 
 
-def inject_attacks(df: pd.DataFrame, specs: List[AttackSpec], seed: int = 0) -> Tuple[pd.DataFrame, pd.Series]:
+def inject_attacks(df: pd.DataFrame, specs: List[AttackSpec], seed: int = 0, respect_gate: bool = True) -> Tuple[pd.DataFrame, pd.Series]:
     rng = np.random.default_rng(seed)
     attacked = df.copy()
     labels = pd.Series(np.zeros(len(attacked), dtype=int), index=attacked.index)
-    gate = attacked.apply(default_gate, axis=1).values
+    gate = (df.apply(default_gate, axis=1).values if respect_gate else np.ones(len(df), dtype=int))
 
     for spec in specs:
         i = 0
