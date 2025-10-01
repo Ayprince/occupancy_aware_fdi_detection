@@ -125,68 +125,70 @@ def main():
     train_cutoff = t0 + pd.Timedelta(days=args.train_days)
 
     if args.inject:
-    labels_path = Path(f"{out_prefix}_labels.csv")
-    attacked_path = Path(f"{out_prefix}_attacked.csv")
+        labels_path = Path(f"{out_prefix}_labels.csv")
+        attacked_path = Path(f"{out_prefix}_attacked.csv")
 
-    if args.structured:
-        from c2_glr import inject_structured_attacks
+        if args.structured:
+            from c2_glr import inject_structured_attacks
 
-        modes = ([args.attack_mode] if args.attack_mode in ("additive","deductive")
-                 else ["additive","deductive"])
-        hours_list = [int(h.strip()) for h in args.hours.split(",") if h.strip()!=""] if args.hours else None
-        start_day = pd.to_datetime(args.start_day, utc=True) if args.start_day else None
+            modes = ([args.attack_mode] if args.attack_mode in ("additive","deductive")
+                    else ["additive","deductive"])
+            hours_list = [int(h.strip()) for h in args.hours.split(",") if h.strip()!=""] if args.hours else None
+            start_day = pd.to_datetime(args.start_day, utc=True) if args.start_day else None
 
-        df_attacked, labels, summary = inject_structured_attacks(
-            df,
-            modes=modes,
-            delta_min=args.delta_min,
-            delta_max=args.delta_max,
-            hours=hours_list,
-            span_hours=args.span_hours,
-            days=4,
-            start_day_utc=start_day,
-            seed=args.seed,
-        )
-        df_to_use = df_attacked
-        df_attacked.to_csv(attacked_path, index=False)
-        labels.to_csv(labels_path, index=False, header=["label"])
-        print(f"[OK] Saved injected series -> {attacked_path}")
-        print(f"[OK] Saved labels         -> {labels_path}")
+            df_attacked, labels, summary = inject_structured_attacks(
+                df,
+                modes=modes,
+                delta_min=args.delta_min,
+                delta_max=args.delta_max,
+                hours=hours_list,
+                span_hours=args.span_hours,
+                days=4,
+                start_day_utc=start_day,
+                seed=args.seed,
+            )
+            df_to_use = df_attacked
+            df_attacked.to_csv(attacked_path, index=False)
+            labels.to_csv(labels_path, index=False, header=["label"])
+            print(f"[OK] Saved injected series -> {attacked_path}")
+            print(f"[OK] Saved labels         -> {labels_path}")
 
-        # ---- Pretty summary ----
-        print("[Attack Summary]")
-        print(f"  window_days: {summary['window_days']}")
-        print(f"  start UTC:   {summary['start_day_utc']}  end UTC: {summary['end_day_utc']}")
-        for s in summary["attacks"]:
-            print(f"  - mode={s['mode']:<9} delta={s['delta']:.2f} L/min  hours={s['hours']}")
-            print(f"    targeted minutes={s['minutes_targeted']}  affected minutes={s['minutes_affected']}")
-            print(f"    mean_before={s['mean_before']:.3f}  mean_after={s['mean_after']:.3f}")
+            # ---- Pretty summary ----
+            print("[Attack Summary]")
+            print(f"  window_days: {summary['window_days']}")
+            print(f"  start UTC:   {summary['start_day_utc']}  end UTC: {summary['end_day_utc']}")
+            for s in summary["attacks"]:
+                print(f"  - mode={s['mode']:<9} delta={s['delta']:.2f} L/min  hours={s['hours']}")
+                print(f"    targeted minutes={s['minutes_targeted']}  affected minutes={s['minutes_affected']}")
+                print(f"    mean_before={s['mean_before']:.3f}  mean_after={s['mean_after']:.3f}")
 
+        else:
+            # keep your existing stochastic injector for baseline comparisons
+            from c2_glr import AttackSpec, inject_attacks
+            specs = [
+                AttackSpec(mode="additive",  delta_L_per_min=args.add_delta, prob_per_min=0.004),
+                AttackSpec(mode="deductive", delta_L_per_min=args.ded_delta, prob_per_min=0.004),
+            ]
+            df_attacked, labels = inject_attacks(
+                df,
+                specs,
+                seed=args.seed,
+                respect_gate=(not args.inject_anywhere),
+                only_after_ts=(None if args.inject_in_train else train_cutoff),
+            )
+            df_to_use = df_attacked
+            df_attacked.to_csv(attacked_path, index=False)
+            labels.to_csv(labels_path, index=False, header=["label"])
+            print(f"[OK] Saved injected series -> {attacked_path}")
+            print(f"[OK] Saved labels         -> {labels_path}")
+            try:
+                import numpy as np
+                uniq, cnts = np.unique(labels.values, return_counts=True)
+                print("[Diag] label counts:", dict(zip(uniq.tolist(), cnts.tolist())))
+            except Exception:
+                pass
     else:
-        # keep your existing stochastic injector for baseline comparisons
-        from c2_glr import AttackSpec, inject_attacks
-        specs = [
-            AttackSpec(mode="additive",  delta_L_per_min=args.add_delta, prob_per_min=0.004),
-            AttackSpec(mode="deductive", delta_L_per_min=args.ded_delta, prob_per_min=0.004),
-        ]
-        df_attacked, labels = inject_attacks(
-            df,
-            specs,
-            seed=args.seed,
-            respect_gate=(not args.inject_anywhere),
-            only_after_ts=(None if args.inject_in_train else train_cutoff),
-        )
-        df_to_use = df_attacked
-        df_attacked.to_csv(attacked_path, index=False)
-        labels.to_csv(labels_path, index=False, header=["label"])
-        print(f"[OK] Saved injected series -> {attacked_path}")
-        print(f"[OK] Saved labels         -> {labels_path}")
-        try:
-            import numpy as np
-            uniq, cnts = np.unique(labels.values, return_counts=True)
-            print("[Diag] label counts:", dict(zip(uniq.tolist(), cnts.tolist())))
-        except Exception:
-            pass
+        df_to_use = df
 
     params = DetectorParams(
         train_days=args.train_days,
