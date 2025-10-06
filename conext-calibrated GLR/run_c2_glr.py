@@ -111,6 +111,9 @@ def main():
         # Reporting
     ap.add_argument("--report", action="store_true", help="Print diagnostic detection rates in post-train window")
 
+    ap.add_argument("--gate-mode", type=str, choices=["strict","lenient","always"], default="strict",
+                    help="Gate policy for GLR updates: strict (default), lenient, or always-open")
+
     args = ap.parse_args()
 
     csv_path = Path(args.csv)
@@ -146,6 +149,7 @@ def main():
                 days=4,
                 start_day_utc=start_day,
                 seed=args.seed,
+                only_after_ts=(None if args.inject_in_train else train_cutoff),
             )
             df_to_use = df_attacked
             df_attacked.to_csv(attacked_path, index=False)
@@ -157,6 +161,8 @@ def main():
             print("[Attack Summary]")
             print(f"  window_days: {summary['window_days']}")
             print(f"  start UTC:   {summary['start_day_utc']}  end UTC: {summary['end_day_utc']}")
+            if summary.get("only_after_ts") is not None:
+                print(f"  enforced cutoff (post-train only): {summary['only_after_ts']}")
             for s in summary["attacks"]:
                 print(f"  - mode={s['mode']:<9} delta={s['delta']:.2f} L/min  hours={s['hours']}")
                 print(f"    targeted minutes={s['minutes_targeted']}  affected minutes={s['minutes_affected']}")
@@ -182,7 +188,6 @@ def main():
             print(f"[OK] Saved injected series -> {attacked_path}")
             print(f"[OK] Saved labels         -> {labels_path}")
             try:
-                import numpy as np
                 uniq, cnts = np.unique(labels.values, return_counts=True)
                 print("[Diag] label counts:", dict(zip(uniq.tolist(), cnts.tolist())))
             except Exception:
@@ -211,6 +216,7 @@ def main():
         bern_p1=args.bern_p1,
         bern_delta=args.bern_delta,
         bern_h=args.bern_h,
+        gate_mode=args.gate_mode,
     )
     det = run_c2_glr(df_to_use, params)
     det_path = Path(f"{out_prefix}_detections.csv")
@@ -287,7 +293,6 @@ def main():
 
         # Diagnostics: how many labels in post-train region
         try:
-            import numpy as np
             uniq, cnts = np.unique(lab_sub, return_counts=True)
             print("[Diag/post-train] label counts:", dict(zip(uniq.tolist(), cnts.tolist())))
         except Exception:

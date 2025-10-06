@@ -64,6 +64,26 @@ def default_gate(row: pd.Series) -> int:
     # Gate opens if there is explicit activity, or if occupied and (evening or an appliance is on)
     return int((has_act == 1) or (occupied == 1 and (is_even or app_on)))
 
+# --------- Parameterized gate policy ---------
+def gate_from_policy(row: pd.Series, policy: str = "strict") -> int:
+    """Return gate according to policy.
+    strict  : existing default_gate
+    lenient : open if (occupied OR has_activity OR evening 6-22 OR any appliance on)
+    always  : gate always open (1)
+    """
+    policy = (policy or "strict").lower()
+    if policy == "always":
+        return 1
+    hour = int(row.get("hour", 0) or 0)
+    app_on = int(row.get("dishwasher_running", 0) or 0) or int(row.get("washing_machine_running", 0) or 0)
+    if policy == "lenient":
+        occ = int(row.get("occupied", 0) or 0)
+        act = int(row.get("has_activity", 0) or 0)
+        is_evening = 6 <= hour < 23
+        return int((occ == 1) or (act == 1) or is_evening or app_on)
+    # default
+    return default_gate(row)
+
 
 def stratum_id(row: pd.Series) -> Tuple[int, int, int]:
     """
@@ -301,6 +321,8 @@ class DetectorParams:
     bern_p0: float = 0.1
     bern_p1: float = 0.35
     bern_h: float = 8.0
+    # Gate policy: "strict" (default), "lenient", or "always"
+    gate_mode: str = "strict"
 class BernoulliCUSUM:
     """
     One-sided Bernoulli CUSUM on exceedance indicators z_t in {0,1}.
@@ -475,7 +497,7 @@ def run_c2_glr(df: pd.DataFrame, params: DetectorParams) -> pd.DataFrame:
             p_pos = p_neg = p
 
         # Gate and GLR-CUSUM
-        gate = default_gate(row)
+        gate = gate_from_policy(row, getattr(params, "gate_mode", "strict"))
         a_pos, a_neg = glr.update(r_t, sigma_t, gate)
 
         # Multiscale GLR updates
@@ -562,10 +584,18 @@ class AttackSpec:
 # Structured Attack Injection (4-day, same-hour pattern)
 # -----------------------------
 
-def _find_consecutive_4day_block(ts: pd.Series, rng: np.random.Generator) -> Optional[pd.Timestamp]:
-    """Return the UTC midnight timestamp of a random 4-consecutive-day block start, if available."""
+def _find_consecutive_4day_block(
+    ts: pd.Series,
+    rng: np.random.Generator,
+    min_start_ts: Optional[pd.Timestamp] = None
+) -> Optional[pd.Timestamp]:
+    """Return the UTC midnight timestamp of a random 4-consecutive-day block start, optionally constrained to start >= min_start_ts."""
     days = pd.to_datetime(ts, utc=True).dt.floor('D')
     uniq = days.drop_duplicates().sort_values().reset_index(drop=True)
+    if min_start_ts is not None:
+        min_day = pd.to_datetime(min_start_ts, utc=True).floor('D')
+        uniq = uniq[uniq >= min_day]
+        uniq = uniq.reset_index(drop=True)
     candidates = []
     for i in range(len(uniq) - 3):
         d0, d1, d2, d3 = uniq.iloc[i:i+4]
@@ -587,6 +617,7 @@ def inject_structured_attacks(
     days: int = 4,
     start_day_utc: Optional[pd.Timestamp] = None,
     seed: int = 0,
+    only_after_ts: Optional[pd.Timestamp] = None,
 ) -> Tuple[pd.DataFrame, pd.Series, Dict[str, Any]]:
     """
     Inject structured attacks over a 4-day window at the *same hours each day*.
@@ -607,17 +638,22 @@ def inject_structured_attacks(
         attacked = add_time_features(attacked, "timestamp_utc")
 
     ts = pd.to_datetime(attacked["timestamp_utc"], utc=True)
+    # Choose a 4-day consecutive block, honoring only_after_ts if provided
     if start_day_utc is None:
-        start_day_utc = _find_consecutive_4day_block(ts, rng)
+        start_day_utc = _find_consecutive_4day_block(ts, rng, min_start_ts=only_after_ts)
     if start_day_utc is None:
-        # Fallback: first 4 unique days (even if not strictly consecutive)
+        # Fallback: first 4 unique days at/after cutoff (if provided), else anywhere
         uniq = ts.dt.floor('D').drop_duplicates().sort_values()
+        if only_after_ts is not None:
+            uniq = uniq[uniq >= pd.to_datetime(only_after_ts, utc=True).floor('D')]
         if len(uniq) >= days:
             start_day_utc = uniq.iloc[0]
         else:
             start_day_utc = ts.dt.floor('D').min()
     end_day_utc = start_day_utc + pd.Timedelta(days=days)
     in_block = (ts >= start_day_utc) & (ts < end_day_utc)
+    if only_after_ts is not None:
+        in_block = in_block & (ts >= pd.to_datetime(only_after_ts, utc=True))
 
     hours_all = list(range(24))
 
@@ -689,6 +725,7 @@ def inject_structured_attacks(
         "start_day_utc": pd.to_datetime(start_day_utc),
         "end_day_utc": pd.to_datetime(end_day_utc),
         "attacks": summaries,
+        "only_after_ts": (pd.to_datetime(only_after_ts) if only_after_ts is not None else None),
     }
     return attacked, labels, summary
 
